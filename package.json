@@ -1,0 +1,43 @@
+{
+  "name": "gnosis-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "migrate": "tsx src/db/migrate.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.14.0",
+    "@huggingface/transformers": "^3.7.0",
+    "bullmq": "^5.56.0",
+    "drizzle-orm": "^0.44.0",
+    "hono": "^4.8.0",
+    "ioredis": "^5.7.0",
+    "jose": "^6.0.0",
+    "pg": "^8.16.0",
+    "unpdf": "^1.3.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/pg": "^8.15.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "onnxruntime-node",
+      "@huggingface/transformers",
+      "sharp",
+      "msw"
+    ]
+  },
+  "packageManager": "pnpm@10.16.1"
+}
