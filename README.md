@@ -72,6 +72,36 @@ only assert supported claims and outcome corrections are applied), reranking
 (interface records `reranker: null`), and S3-compatible storage (bytes live
 in Postgres under stable immutable keys).
 
+## Deployment (Neon + a small VPS)
+
+The boring, cheap shape: **Neon Postgres** (free tier, pgvector supported)
+for the database, one small VPS (2 GB is plenty) running the app + Redis
+via docker compose, and the Next.js frontend on Vercel.
+
+1. **Neon**: create a project, copy the connection string into `.env` as
+   `DATABASE_URL` (the pooled `-pooler` host is fine for this app).
+2. **`.env` on the VPS** — production values:
+   - `DATABASE_URL` — Neon connection string
+   - `REDIS_URL` — leave unset; compose provides Redis automatically
+   - `API_URL` — the public URL of this API (used for signed upload URLs)
+   - `AUTH_MODE=supabase` + `SUPABASE_JWT_SECRET` (or `SUPABASE_JWKS_URL`)
+   - `ALLOWED_ORIGINS` — your frontend origin(s), comma-separated
+   - optionally `GEMINI_API_KEY` for generated answers (evidence-only mode
+     otherwise)
+3. **Deploy**: `docker compose --profile app up -d --build` — builds the
+   image (embedding model baked in), starts Redis + the app on :3000.
+4. **Migrate** once per release: `docker compose --profile app run --rm
+   app node dist/db/migrate.js` (explicit; never at boot).
+5. **Frontend**: set `NEXT_PUBLIC_GNOSIS_API=https://<your-api-host>` on
+   Vercel.
+
+Local development is unchanged: `docker compose --profile dev up -d`
+(Postgres + Redis), `pnpm migrate`, `pnpm dev`.
+
+Notes: Neon's free tier autosuspends idle computes — the first request
+after a pause pays a sub-second wake-up. Long-lived API connections from
+the compose app are fine; the pg pool is capped at 10.
+
 ## Scripts
 
 ```bash

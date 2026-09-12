@@ -1,0 +1,8 @@
+node_modules
+dist
+.models
+.env
+.env.local
+api-run.log
+*.log
+.git

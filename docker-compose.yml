@@ -1,5 +1,8 @@
 services:
+  # Local development Postgres (pgvector). Production uses Neon — set
+  # DATABASE_URL in .env and start with: docker compose --profile app up.
   postgres:
+    profiles: ["dev"]
     image: pgvector/pgvector:pg17
     environment:
       POSTGRES_USER: gnosis
@@ -15,6 +18,7 @@ services:
       timeout: 3s
       retries: 20
 
+  # Redis for BullMQ queues (needed in every environment).
   redis:
     image: redis:7-alpine
     ports:
@@ -24,6 +28,22 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+
+  # The API + workers. Requires a reachable DATABASE_URL (Neon in
+  # production; the dev postgres above for local use).
+  app:
+    profiles: ["app"]
+    build: .
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      # Inside compose, Redis is always the bundled service.
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pgdata:
