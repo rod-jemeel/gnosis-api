@@ -11,7 +11,7 @@ import { db, schema } from '../db/client.js'
 import { limits } from '../config.js'
 import { generateJson, GenerationUnavailable } from '../providers/generation.js'
 import { generationProvider } from '../config.js'
-import { retrieve, type CandidateChunk, type SearchScope } from './retrieval.js'
+import { retrieve, uuidArrayLiteral, type CandidateChunk, type SearchScope } from './retrieval.js'
 
 export const V2_SCHEMA_VERSION = '2.0'
 
@@ -147,8 +147,9 @@ interface FinalResultOut {
   sourceSnapshot: unknown
   pipeline: unknown
   warnings: string[]
-  checks: { claimsChecked: number; supported: number; failed: number }
+  checks: { claimsChecked: number; supported: number; failed: number; method: string }
   usage: { promptTokens: number; completionTokens: number; totalTokens: number; status: string }
+  judgmentUsage?: { inputTokens: number | null; outputTokens: number | null; status: string } | null
   timings: { queueMs: number; retrievalMs: number; generationMs: number; checkingMs: number; totalMs: number }
 }
 
@@ -173,7 +174,34 @@ export async function executeRun(runId: string): Promise<void> {
   const timings = { queueMs: 0, retrievalMs: 0, generationMs: 0, checkingMs: 0, totalMs: 0 }
   timings.queueMs = Math.max(0, Date.now() - run.createdAt.getTime())
 
+  // Provider-stage cancellation: aborted when the run is cancelled so an
+  // in-flight judgment or generation call stops promptly (spec §10.2).
+  const stageAbort = new AbortController()
+
+  const cancelNow = async () => {
+    stageAbort.abort()
+    await finalizeCancelled(runId, run.workspaceId)
+  }
+
   try {
+    // Re-resolve the actor at execution time; run creation once
+    // succeeding is not proof permission still holds (spec §7.4).
+    const [membership] = await db
+      .select({ userId: schema.workspaceMembers.userId })
+      .from(schema.workspaceMembers)
+      .where(
+        and(
+          eq(schema.workspaceMembers.workspaceId, run.workspaceId),
+          eq(schema.workspaceMembers.userId, run.userId),
+          eq(schema.workspaceMembers.status, 'active')
+        )
+      )
+      .limit(1)
+    if (!membership) {
+      await finalizeCancelled(runId, run.workspaceId)
+      return
+    }
+
     await db
       .update(schema.runs)
       .set({ status: 'running', startedAt: new Date() })
@@ -183,15 +211,32 @@ export async function executeRun(runId: string): Promise<void> {
     // --- Retrieval over the captured snapshot ---
     const t0 = Date.now()
     const scope = run.scope as SearchScope
-    const retrieval = await retrieve(run.workspaceId, scope, run.question)
+    const retrieval = await retrieve(run.workspaceId, scope, run.question, {
+      runId,
+      signal: stageAbort.signal,
+    })
     timings.retrievalMs = Date.now() - t0
     await db.update(schema.runs).set({ details: retrieval.details }).where(eq(schema.runs.id, runId))
     await appendRunEvent(runId, run.workspaceId, 'retrieval.completed', {
       details: retrieval.details,
     })
-    if (await isCancelled(runId)) return finalizeCancelled(runId, run.workspaceId)
+    if (await isCancelled(runId)) return cancelNow()
 
-    const evidence = buildEvidence(retrieval.selected)
+    // Judgment provider usage is recorded separately from generation
+    // usage and never overwrites it (spec §15.3, APP-09).
+    const judgment = retrieval.details.judgment ?? null
+    if (judgment && judgment.usage.status === 'known') {
+      await db.insert(schema.usageEvents).values({
+        workspaceId: run.workspaceId,
+        runId,
+        provider: 'typesafe',
+        model: judgment.returnedModel ?? judgment.requestedModel,
+        inputTokens: judgment.usage.inputTokens,
+        outputTokens: judgment.usage.outputTokens,
+      })
+    }
+
+    let evidence = buildEvidence(retrieval.selected)
     let outcome: ModelAnswer['outcome'] | 'insufficient_evidence' = 'insufficient_evidence'
     let claims: ReturnType<typeof validateClaims> = []
     let limitations: string[] = []
@@ -199,6 +244,9 @@ export async function executeRun(runId: string): Promise<void> {
     let usageStatus: 'known' | 'unavailable' = 'known'
     let generatorModel = 'none (no evidence retrieved)'
     const resultWarnings: string[] = []
+    if (judgment && judgment.mode !== 'off' && judgment.status === 'fallback') {
+      resultWarnings.push('Evidence ranking unavailable; standard search used.')
+    }
 
     if (evidence.length === 0) {
       outcome = 'insufficient_evidence'
@@ -263,7 +311,7 @@ export async function executeRun(runId: string): Promise<void> {
         })
         model = parseModelAnswer(generation.content)
       }
-      if (await isCancelled(runId)) return finalizeCancelled(runId, run.workspaceId)
+      if (await isCancelled(runId)) return cancelNow()
 
       // --- Checking ---
       const t2 = Date.now()
@@ -304,7 +352,34 @@ export async function executeRun(runId: string): Promise<void> {
       timings.checkingMs = Date.now() - t2
     }
 
-    if (await isCancelled(runId)) return finalizeCancelled(runId, run.workspaceId)
+    if (await isCancelled(runId)) return cancelNow()
+
+    // Revalidate evidence against the CURRENT active builds and
+    // lifecycle before publication (spec §11.3, RANK-16). Sources can
+    // be deleted or replaced while generation was running.
+    const revalidated = await revalidateEvidence(run.workspaceId, evidence)
+    if (revalidated.removedChunkIds.length > 0) {
+      if (scope.type === 'selected_documents') {
+        await failSourceChanged(runId, run.workspaceId)
+        return
+      }
+      resultWarnings.push('A source changed during this answer; affected evidence was removed.')
+      const staleIds = new Set(revalidated.removedChunkIds)
+      evidence = evidence.filter((e) => !staleIds.has(e.chunkId))
+      const liveEvidenceIds = new Set(evidence.map((e) => e.evidenceId))
+      claims = claims
+        .map((c) => ({
+          ...c,
+          evidenceIds: c.evidenceIds.filter((id) => liveEvidenceIds.has(id)),
+        }))
+        .filter((c) => c.evidenceIds.length > 0)
+      if (outcome === 'answered' && claims.length === 0) {
+        outcome = 'insufficient_evidence'
+        limitations = [
+          'A source changed during this answer; the remaining documents do not answer it.',
+        ]
+      }
+    }
 
     // --- Final publication: one transaction (spec §14.4) ---
     const result: FinalResultOut = {
@@ -320,7 +395,7 @@ export async function executeRun(runId: string): Promise<void> {
         text: claim.text,
         evidenceIds: claim.evidenceIds,
         checkStatus: 'supported',
-        checkNote: 'Claim cites supplied evidence; handles validated deterministically.',
+        checkNote: 'Citation checked against supplied evidence; semantic support not evaluated.',
       })),
       limitations,
       conflicts: [],
@@ -356,8 +431,10 @@ export async function executeRun(runId: string): Promise<void> {
         claimsChecked: claims.length,
         supported: claims.length,
         failed: 0,
+        method: 'citation_handle_membership',
       },
       usage: { ...usage, status: usageStatus },
+      judgmentUsage: judgment?.usage ?? null,
       timings: { ...timings, totalMs: Date.now() - startedAtMs },
     }
 
@@ -389,7 +466,10 @@ export async function executeRun(runId: string): Promise<void> {
       result.userMessageId = userMessage?.id ?? null
       result.assistantMessageId = assistant?.id ?? null
 
-      await tx
+      // Fencing: only the worker holding a 'running' run may publish.
+      // A cancellation committed first wins (APP-05); a stale worker
+      // must not overwrite newer or terminal state (APP-04).
+      const fenced = await tx
         .update(schema.runs)
         .set({
           status: 'completed',
@@ -397,7 +477,11 @@ export async function executeRun(runId: string): Promise<void> {
           result,
           completedAt: new Date(),
         })
-        .where(eq(schema.runs.id, runId))
+        .where(and(eq(schema.runs.id, runId), eq(schema.runs.status, 'running')))
+        .returning({ id: schema.runs.id })
+      if (fenced.length === 0) {
+        throw new Error('stale_worker')
+      }
       await tx.insert(schema.runEvents).values([
         {
           runId,
@@ -423,6 +507,10 @@ export async function executeRun(runId: string): Promise<void> {
         .where(and(eq(schema.jobs.kind, 'answer'), eq(schema.jobs.refId, runId)))
     })
   } catch (err) {
+    if (err instanceof Error && err.message === 'stale_worker') {
+      console.warn(`[answers] run ${runId}: finalization lost the lease; stale publication skipped`)
+      return
+    }
     const message = err instanceof Error ? err.message : 'The run failed.'
     console.error(`[answers] run ${runId} failed:`, message)
     await db
@@ -494,11 +582,65 @@ const STOPWORDS = new Set([
 ])
 
 async function finalizeCancelled(runId: string, workspaceId: string) {
-  await db
+  const fenced = await db
     .update(schema.runs)
     .set({ status: 'cancelled', completedAt: new Date() })
-    .where(eq(schema.runs.id, runId))
+    .where(
+      and(
+        eq(schema.runs.id, runId),
+        sql`${schema.runs.status} in ('queued','running','cancelling')`
+      )
+    )
+    .returning({ id: schema.runs.id })
+  if (fenced.length === 0) return
   await appendRunEvent(runId, workspaceId, 'run.cancelled')
+}
+
+/** Typed operational failure when strict selected scope can no longer
+ *  be fulfilled because a source changed mid-run (spec §11.3). */
+async function failSourceChanged(runId: string, workspaceId: string) {
+  const fenced = await db
+    .update(schema.runs)
+    .set({
+      status: 'failed',
+      errorCode: 'SOURCE_CHANGED',
+      errorMessage: 'A selected source changed during this answer. Start a new run with an updated scope.',
+      errorRetryable: false,
+      completedAt: new Date(),
+    })
+    .where(and(eq(schema.runs.id, runId), sql`${schema.runs.status} in ('running','cancelling')`))
+    .returning({ id: schema.runs.id })
+  if (fenced.length === 0) return
+  await appendRunEvent(runId, workspaceId, 'run.failed', {
+    code: 'SOURCE_CHANGED',
+    message: 'A selected source changed during this answer.',
+    retryable: false,
+  })
+}
+
+/** Recheck that evidence chunks still belong to their documents'
+ *  current active build and version, and that documents are active. */
+async function revalidateEvidence(
+  workspaceId: string,
+  evidence: EvidenceOut[]
+): Promise<{ removedChunkIds: string[] }> {
+  if (evidence.length === 0) return { removedChunkIds: [] }
+  const ids = evidence.map((e) => e.chunkId)
+  const rows = await db
+    .select({ id: schema.chunks.id })
+    .from(schema.chunks)
+    .innerJoin(schema.documents, eq(schema.documents.id, schema.chunks.documentId))
+    .where(
+      and(
+        eq(schema.chunks.workspaceId, workspaceId),
+        eq(schema.documents.lifecycle, 'active'),
+        eq(schema.documents.activeBuildId, schema.chunks.buildId),
+        eq(schema.documents.activeVersionId, schema.chunks.versionId),
+        sql`${schema.chunks.id} = any(${uuidArrayLiteral(ids)}::uuid[])`
+      )
+    )
+  const valid = new Set(rows.map((r) => r.id))
+  return { removedChunkIds: ids.filter((id) => !valid.has(id)) }
 }
 
 export async function recentRuns(workspaceId: string, limit: number) {

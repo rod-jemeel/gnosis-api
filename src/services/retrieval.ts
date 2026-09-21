@@ -8,6 +8,8 @@ import { and, eq, sql } from 'drizzle-orm'
 import { db, schema } from '../db/client.js'
 import { limits } from '../config.js'
 import { embedQuery } from '../providers/embeddings.js'
+import { rerankCandidates } from './jev/rerank.js'
+import { jevConfigState } from './jev/policy.js'
 
 export type SearchScope =
   | { type: 'all_current' }
@@ -19,6 +21,7 @@ export interface EligibleDoc {
   buildId: string
   versionId: string
   revisionNumber: number
+  contentHash: string
 }
 
 export function uuidArrayLiteral(ids: string[]): string {
@@ -56,6 +59,7 @@ export async function eligibleBuilds(workspaceId: string, scope: SearchScope): P
       buildId: schema.documents.activeBuildId,
       versionId: schema.documents.activeVersionId,
       revisionNumber: schema.documentVersions.revisionNumber,
+      contentHash: schema.documentVersions.contentHash,
     })
     .from(schema.documents)
     .innerJoin(
@@ -69,6 +73,7 @@ export async function eligibleBuilds(workspaceId: string, scope: SearchScope): P
     buildId: r.buildId!,
     versionId: r.versionId!,
     revisionNumber: r.revisionNumber,
+    contentHash: r.contentHash,
   }))
 }
 
@@ -81,6 +86,21 @@ export interface CandidateChunk {
   revisionNumber: number
   page: number
   text: string
+}
+
+/** Safe projection of one judgment stage; no source text, no secrets. */
+export interface JudgmentDiagnostics {
+  stage: 'rerank'
+  mode: 'off' | 'shadow' | 'on'
+  status: 'disabled' | 'skipped' | 'shadow' | 'applied' | 'fallback' | 'cancelled'
+  reason: string | null
+  requestedModel: string
+  returnedModel: string | null
+  rubricVersion: string
+  candidateCount: number
+  truncatedCount: number
+  timingsMs: number
+  usage: { inputTokens: number | null; outputTokens: number | null; status: 'known' | 'unavailable' }
 }
 
 export interface RetrievalResult {
@@ -104,15 +124,25 @@ export interface RetrievalResult {
       rrfConstant: number
       reranker: string | null
     }
+    /** Additive, versioned projection; absent when no stage ran. */
+    judgment?: JudgmentDiagnostics
   }
   /** Which selected document ids were missing/unavailable in scope. */
   missingDocumentIds: string[]
 }
 
+/** Caller-supplied execution context for optional judgment stages. */
+export interface RetrievalHooks {
+  runId?: string
+  /** Parent run cancellation — authoritative over stage deadlines. */
+  signal?: AbortSignal
+}
+
 export async function retrieve(
   workspaceId: string,
   scope: SearchScope,
-  question: string
+  question: string,
+  hooks: RetrievalHooks = {}
 ): Promise<RetrievalResult> {
   const eligible = await eligibleBuilds(workspaceId, scope)
   const eligibleIds = new Set(eligible.map((d) => d.documentId))
@@ -199,7 +229,6 @@ export async function retrieve(
 
   const lexicalRankById = new Map(lexical.rows.map((row, index) => [row.id, index + 1]))
   const denseRankById = new Map(dense.map((row, index) => [row.id, index + 1]))
-  const selectedIds = new Set(fusedOrder.slice(0, limits.maxEvidenceChunks).map(([id]) => id))
 
   // Hydrate candidates from PostgreSQL after authorization (second
   // scoped check; spec §13.4).
@@ -220,24 +249,91 @@ export async function retrieve(
     : []
   const chunkById = new Map(hydrated.map((row) => [row.id, row]))
 
-  const candidates = fusedOrder.slice(0, 20).map(([chunkId, score]) => {
-    const chunk = chunkById.get(chunkId)
-    const doc = chunk ? docByBuild.get(chunk.build_id) : undefined
+  // Fused candidate entries in fusion order, restricted to hydrated rows.
+  const fusedEntries = fusedOrder
+    .slice(0, 20)
+    .filter(([id]) => chunkById.has(id))
+    .map(([id, score]) => ({ chunkId: id, fusionScore: Number(score.toFixed(6)) }))
+
+  // Optional Jev reranking (R1): policy-gated, at most one bounded
+  // request. Without hooks (or with mode=off) nothing runs and the
+  // baseline ordering is preserved exactly (fallback parity, RANK-15).
+  let judgment: JudgmentDiagnostics | undefined
+  let orderedEntries = fusedEntries
+  if (hooks.runId) {
+    const jevInput = fusedEntries.map((entry, index) => {
+      const chunk = chunkById.get(entry.chunkId)!
+      const doc = docByBuild.get(chunk.build_id)!
+      return {
+        chunkId: chunk.id,
+        documentId: chunk.document_id,
+        versionId: doc.versionId,
+        buildId: chunk.build_id,
+        contentHash: doc.contentHash,
+        text: chunk.text,
+        baselineRank: index + 1,
+      }
+    })
+    const decision = await rerankCandidates(jevInput, {
+      runId: hooks.runId,
+      workspaceId,
+      question: normalizedQuery,
+      signal: hooks.signal,
+    })
+    timings.rerankMs = decision.timingsMs
+    judgment = {
+      stage: 'rerank',
+      mode: jevConfigState.config.mode,
+      status: decision.status,
+      reason: decision.reason,
+      requestedModel: decision.requestedModel,
+      returnedModel: decision.returnedModel,
+      rubricVersion: decision.rubricVersion,
+      candidateCount: decision.candidateCount,
+      truncatedCount: decision.truncatedCount,
+      timingsMs: decision.timingsMs,
+      usage: decision.usage,
+    }
+    if (decision.status === 'applied') {
+      // Jev reordered only the supplied candidates (INV-03): order the
+      // known entries by the applied ranking, keeping any entry the
+      // decision omitted at the tail in fusion order.
+      const position = new Map(decision.orderedChunkIds.map((id, i) => [id, i]))
+      orderedEntries = [...fusedEntries].sort((a, b) => {
+        const pa = position.get(a.chunkId) ?? Number.MAX_SAFE_INTEGER
+        const pb = position.get(b.chunkId) ?? Number.MAX_SAFE_INTEGER
+        return pa - pb
+      })
+    }
+  }
+
+  const rerankRankById = new Map<string, number>()
+  if (judgment && judgment.status === 'applied') {
+    orderedEntries.forEach((entry, index) => rerankRankById.set(entry.chunkId, index + 1))
+  }
+  const selectedIds = new Set(
+    orderedEntries.slice(0, limits.maxEvidenceChunks).map((e) => e.chunkId)
+  )
+
+  const candidates = orderedEntries.map((entry) => {
+    const chunk = chunkById.get(entry.chunkId)!
+    const doc = docByBuild.get(chunk.build_id)!
     return {
-      chunkId,
-      documentId: chunk?.document_id ?? '',
-      documentName: doc?.title ?? 'Unknown',
-      denseRank: denseRankById.get(chunkId) ?? null,
-      lexicalRank: lexicalRankById.get(chunkId) ?? null,
-      fusionScore: Number(score.toFixed(6)),
-      rerankRank: null as number | null,
-      selected: selectedIds.has(chunkId),
+      chunkId: entry.chunkId,
+      documentId: chunk.document_id,
+      documentName: doc.title,
+      denseRank: denseRankById.get(entry.chunkId) ?? null,
+      lexicalRank: lexicalRankById.get(entry.chunkId) ?? null,
+      fusionScore: entry.fusionScore,
+      rerankRank: rerankRankById.get(entry.chunkId) ?? null,
+      selected: selectedIds.has(entry.chunkId),
     }
   })
 
-  const selected: CandidateChunk[] = [...selectedIds]
-    .map((chunkId) => chunkById.get(chunkId))
-    .filter((c): c is NonNullable<typeof c> => Boolean(c))
+  const selected: CandidateChunk[] = orderedEntries
+    .slice(0, limits.maxEvidenceChunks)
+    .map((entry) => chunkById.get(entry.chunkId)!)
+    .filter((chunk): chunk is NonNullable<typeof chunk> => Boolean(chunk))
     .map((chunk) => {
       const doc = docByBuild.get(chunk.build_id)!
       return {
@@ -263,8 +359,12 @@ export async function retrieve(
         denseTopK: limits.denseTopK,
         lexicalTopK: limits.lexicalTopK,
         rrfConstant: limits.rrfConstant,
-        reranker: null,
+        reranker:
+          judgment && judgment.status === 'applied'
+            ? `jev ${judgment.rubricVersion} (typesafe)`
+            : null,
       },
+      ...(judgment ? { judgment } : {}),
     },
   }
 }

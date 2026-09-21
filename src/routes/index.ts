@@ -387,7 +387,9 @@ v2.post('/workspaces/:workspaceId/runs/:runId/cancel', async (c) => {
     .where(and(eq(schema.runs.id, c.req.param('runId')), eq(schema.runs.workspaceId, tenant.workspaceId)))
     .limit(1)
   if (!run) throw notFound('Run not found.')
-  if (run.status === 'completed') return c.json({}) // completion committed first
+  if (run.status === 'completed' || run.status === 'cancelling') {
+    return c.json({}) // completion committed first / cancellation already pending
+  }
   if (run.status === 'queued') {
     await db
       .update(schema.runs)
