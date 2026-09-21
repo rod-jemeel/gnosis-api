@@ -11,7 +11,11 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "migrate": "tsx src/db/migrate.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:jev": "tsx --test tests/jev/*.test.mjs",
+    "test:jev:integration": "tsx tests/jev/run-integration.mts",
+    "test:jev:live": "tsx tests/jev/live-smoke.mts",
+    "eval:jev": "echo 'evaluation harness lands with WP-06; see docs/jev.md' && exit 1"
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",

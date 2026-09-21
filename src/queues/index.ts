@@ -35,6 +35,48 @@ export async function removeQueueJob(kind: 'ingestion' | 'answers' | 'purge', jo
   await queue.remove(jobId)
 }
 
+/**
+ * Reconcile durable work committed to PostgreSQL whose queue message
+ * never arrived (crash between commit and enqueue, APP-06). Runs and
+ * builds stuck in a nonterminal state older than the grace period are
+ * re-driven; state-level idempotency makes redelivery harmless.
+ */
+async function reconcileOrphans() {
+  try {
+    const { db, schema } = await import('../db/client.js')
+    const { and, eq, lt, sql } = await import('drizzle-orm')
+    const cutoff = new Date(Date.now() - 60_000)
+
+    const stalledRuns = await db
+      .select({ id: schema.runs.id })
+      .from(schema.runs)
+      .where(and(eq(schema.runs.status, 'queued'), lt(schema.runs.createdAt, cutoff)))
+      .limit(50)
+    for (const run of stalledRuns) {
+      await removeQueueJob('answers', `run-${run.id}`)
+      await enqueue('answers', run.id)
+    }
+
+    const stalledBuilds = await db
+      .select({ id: schema.indexBuilds.id })
+      .from(schema.indexBuilds)
+      .where(and(eq(schema.indexBuilds.state, 'queued'), lt(schema.indexBuilds.createdAt, cutoff)))
+      .limit(50)
+    for (const build of stalledBuilds) {
+      await removeQueueJob('ingestion', `ingest-${build.id}`)
+      await enqueue('ingestion', build.id)
+    }
+
+    if (stalledRuns.length > 0 || stalledBuilds.length > 0) {
+      console.log(
+        `[queues] reconciled ${stalledRuns.length} run(s), ${stalledBuilds.length} build(s)`
+      )
+    }
+  } catch (err) {
+    console.error('[queues] reconciliation failed (will retry on next boot):', err instanceof Error ? err.message : err)
+  }
+}
+
 export function startWorkers() {
   const ingestionWorker = new Worker(
     'ingestion',
@@ -58,7 +100,11 @@ export function startWorkers() {
     })
   }
 
+  // Give the workers a moment to come up, then re-drive orphans once.
+  const reconcileTimer = setTimeout(() => void reconcileOrphans(), 5_000)
+
   return async () => {
+    clearTimeout(reconcileTimer)
     await Promise.all([
       ingestionWorker.close(),
       answerWorker.close(),

@@ -11,7 +11,11 @@ import { db, schema } from '../db/client.js'
 import { limits } from '../config.js'
 import { generateJson, GenerationUnavailable } from '../providers/generation.js'
 import { generationProvider } from '../config.js'
-import { retrieve, type CandidateChunk, type SearchScope } from './retrieval.js'
+import { retrieve, uuidArrayLiteral, type CandidateChunk, type SearchScope } from './retrieval.js'
+import { JevRunBudget } from './jev/budget.js'
+import { jevConfigState } from './jev/policy.js'
+import { routeRequest, type RouteDecision } from './jev/routing.js'
+import { assessClaims, type ClaimAssessment } from './jev/claim-support.js'
 
 export const V2_SCHEMA_VERSION = '2.0'
 
@@ -128,6 +132,8 @@ function validateClaims(model: ModelAnswer, evidence: EvidenceOut[]) {
     })
     .filter((claim) => claim.text.length > 0 && claim.evidenceIds.length > 0)
     .slice(0, 8)
+    // Stable ordinal assigned once; assessment and display share it.
+    .map((claim, index) => ({ ...claim, ordinal: index + 1 }))
   return claims
 }
 
@@ -147,8 +153,9 @@ interface FinalResultOut {
   sourceSnapshot: unknown
   pipeline: unknown
   warnings: string[]
-  checks: { claimsChecked: number; supported: number; failed: number }
+  checks: { claimsChecked: number; supported: number; failed: number; method: string; semanticAssessed?: number }
   usage: { promptTokens: number; completionTokens: number; totalTokens: number; status: string }
+  judgmentUsage?: { inputTokens: number | null; outputTokens: number | null; status: string } | null
   timings: { queueMs: number; retrievalMs: number; generationMs: number; checkingMs: number; totalMs: number }
 }
 
@@ -173,34 +180,205 @@ export async function executeRun(runId: string): Promise<void> {
   const timings = { queueMs: 0, retrievalMs: 0, generationMs: 0, checkingMs: 0, totalMs: 0 }
   timings.queueMs = Math.max(0, Date.now() - run.createdAt.getTime())
 
+  // Provider-stage cancellation: aborted when the run is cancelled so an
+  // in-flight judgment or generation call stops promptly (spec §10.2).
+  const stageAbort = new AbortController()
+  // Aggregate Jev HTTP budget shared by routing/rerank/claim stages
+  // (spec §10.3) — stage ceilings are bounded by this remainder.
+  const runBudget = new JevRunBudget(jevConfigState.config.maxRunHttpMs)
+  const judgmentExtras: Record<string, unknown> = {}
+  const judgmentUsageRows: { model: string; inputTokens: number | null; outputTokens: number | null }[] = []
+
+  const cancelNow = async () => {
+    stageAbort.abort()
+    await finalizeCancelled(runId, run.workspaceId)
+  }
+
   try {
+    // Re-resolve the actor at execution time; run creation once
+    // succeeding is not proof permission still holds (spec §7.4).
+    const [membership] = await db
+      .select({ userId: schema.workspaceMembers.userId })
+      .from(schema.workspaceMembers)
+      .where(
+        and(
+          eq(schema.workspaceMembers.workspaceId, run.workspaceId),
+          eq(schema.workspaceMembers.userId, run.userId),
+          eq(schema.workspaceMembers.status, 'active')
+        )
+      )
+      .limit(1)
+    if (!membership) {
+      await finalizeCancelled(runId, run.workspaceId)
+      return
+    }
+
     await db
       .update(schema.runs)
       .set({ status: 'running', startedAt: new Date() })
       .where(eq(schema.runs.id, runId))
     await appendRunEvent(runId, run.workspaceId, 'run.started')
 
-    // --- Retrieval over the captured snapshot ---
-    const t0 = Date.now()
+    // --- Routing (R2, optional): selects a registered path ---
     const scope = run.scope as SearchScope
-    const retrieval = await retrieve(run.workspaceId, scope, run.question)
-    timings.retrievalMs = Date.now() - t0
-    await db.update(schema.runs).set({ details: retrieval.details }).where(eq(schema.runs.id, runId))
-    await appendRunEvent(runId, run.workspaceId, 'retrieval.completed', {
-      details: retrieval.details,
-    })
-    if (await isCancelled(runId)) return finalizeCancelled(runId, run.workspaceId)
+    let activeScope: SearchScope = scope
+    let earlyOutcome: 'clarification_required' | null = null
+    const earlyLimitations: string[] = []
+    const resultWarnings: string[] = []
+    let routing: RouteDecision | null = null
 
-    const evidence = buildEvidence(retrieval.selected)
-    let outcome: ModelAnswer['outcome'] | 'insufficient_evidence' = 'insufficient_evidence'
+    if (jevConfigState.config.routingMode !== 'off' && !jevConfigState.config.killSwitch) {
+      const granted = runBudget.reserve(1500)
+      if (granted > 0) {
+        const prior = await db
+          .select({ content: schema.messages.content })
+          .from(schema.messages)
+          .where(
+            and(
+              eq(schema.messages.sessionId, run.sessionId),
+              eq(schema.messages.role, 'user'),
+              sql`${schema.messages.runId} <> ${runId}`
+            )
+          )
+          .orderBy(desc(schema.messages.sequence))
+          .limit(3)
+        routing = await routeRequest({
+          runId,
+          workspaceId: run.workspaceId,
+          question: run.question,
+          recentQuestions: prior.map((m) => (m.content as { text?: string }).text ?? ''),
+          signal: stageAbort.signal,
+          deadlineMs: granted,
+        })
+        judgmentExtras.routing = {
+          status: routing.status,
+          reason: routing.reason,
+          label: routing.label,
+          counterfactualLabel: routing.counterfactualLabel,
+          confidence: routing.confidence,
+          requestedModel: routing.requestedModel,
+          returnedModel: routing.returnedModel,
+          registryVersion: routing.registryVersion,
+          timingsMs: routing.timingsMs,
+          usage: routing.usage,
+        }
+        if (routing.usage.status === 'known') {
+          judgmentUsageRows.push({
+            model: routing.returnedModel ?? routing.requestedModel,
+            inputTokens: routing.usage.inputTokens,
+            outputTokens: routing.usage.outputTokens,
+          })
+        }
+        if (await isCancelled(runId)) return cancelNow()
+        if (routing.status === 'applied' && routing.label) {
+          const routeLabel = routing.label
+          if (routeLabel === 'unclear') {
+            earlyOutcome = 'clarification_required'
+            earlyLimitations.push(
+              'Your request is ambiguous — please restate it, naming the document or topic you mean.'
+            )
+          } else if (routeLabel === 'out_of_scope') {
+            earlyOutcome = 'clarification_required'
+            earlyLimitations.push(
+              'Gnosis answers questions about the documents in scope; it does not execute tasks.'
+            )
+          } else if (routeLabel === 'document_lookup') {
+            // Server-owned resolution: title-token match over active
+            // documents; a model label can never select IDs directly.
+            const qTokens = new Set(
+              run.question.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 4)
+            )
+            const docs = await db
+              .select({ id: schema.documents.id, title: schema.documents.title })
+              .from(schema.documents)
+              .where(
+                and(
+                  eq(schema.documents.workspaceId, run.workspaceId),
+                  eq(schema.documents.lifecycle, 'active')
+                )
+              )
+            let best: { id: string; title: string; score: number } | null = null
+            for (const doc of docs) {
+              if (activeScope.type === 'selected_documents' && !activeScope.documentIds.includes(doc.id)) {
+                continue
+              }
+              const titleTokens = doc.title.toLowerCase().split(/[^a-z0-9]+/)
+              const score = [...qTokens].filter((t) => titleTokens.includes(t)).length
+              if (score > 0 && (!best || score > best.score)) best = { id: doc.id, title: doc.title, score }
+            }
+            if (best) {
+              activeScope = { type: 'selected_documents', documentIds: [best.id] }
+              resultWarnings.push(`Document lookup: answering from "${best.title}".`)
+            } else {
+              // No matching document: preserve the safe knowledge path
+              // rather than refusing (spec §12.4).
+              resultWarnings.push(
+                'Document lookup requested, but no document in scope matched by name; answering from all current documents instead.'
+              )
+            }
+          }
+          // knowledge_question falls through to the normal path.
+        }
+      }
+    }
+
+    // --- Retrieval over the captured snapshot ---
+    let retrieval: Awaited<ReturnType<typeof retrieve>> | null = null
+    let judgment: import('./retrieval.js').JudgmentDiagnostics | null = null
+    if (!earlyOutcome) {
+      const t0 = Date.now()
+      retrieval = await retrieve(run.workspaceId, activeScope, run.question, {
+        runId,
+        signal: stageAbort.signal,
+      })
+      timings.retrievalMs = Date.now() - t0
+      if (await isCancelled(runId)) return cancelNow()
+      await db
+        .update(schema.runs)
+        .set({ details: { ...retrieval.details, ...judgmentExtras } })
+        .where(eq(schema.runs.id, runId))
+      await appendRunEvent(runId, run.workspaceId, 'retrieval.completed', {
+        details: retrieval.details,
+      })
+
+      // Judgment provider usage is recorded separately from generation
+      // usage and never overwrites it (spec §15.3, APP-09).
+      judgment = retrieval.details.judgment ?? null
+      if (judgment && judgment.usage.status === 'known') {
+        judgmentUsageRows.push({
+          model: judgment.returnedModel ?? judgment.requestedModel,
+          inputTokens: judgment.usage.inputTokens,
+          outputTokens: judgment.usage.outputTokens,
+        })
+      }
+    }
+    for (const row of judgmentUsageRows) {
+      await db.insert(schema.usageEvents).values({
+        workspaceId: run.workspaceId,
+        runId,
+        provider: 'typesafe',
+        model: row.model,
+        inputTokens: row.inputTokens,
+        outputTokens: row.outputTokens,
+      })
+    }
+    if (await isCancelled(runId)) return cancelNow()
+
+    let evidence = earlyOutcome ? [] : buildEvidence(retrieval!.selected)
+    let outcome: ModelAnswer['outcome'] | 'insufficient_evidence' = earlyOutcome ?? 'insufficient_evidence'
     let claims: ReturnType<typeof validateClaims> = []
     let limitations: string[] = []
     let usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
     let usageStatus: 'known' | 'unavailable' = 'known'
     let generatorModel = 'none (no evidence retrieved)'
-    const resultWarnings: string[] = []
+    if (judgment && judgment.mode !== 'off' && judgment.status === 'fallback') {
+      resultWarnings.push('Evidence ranking unavailable; standard search used.')
+    }
 
-    if (evidence.length === 0) {
+    if (earlyOutcome) {
+      outcome = earlyOutcome
+      limitations = [...earlyLimitations]
+    } else if (evidence.length === 0) {
       outcome = 'insufficient_evidence'
       limitations = [
         'Insufficient evidence in the selected documents to answer this question.',
@@ -263,7 +441,7 @@ export async function executeRun(runId: string): Promise<void> {
         })
         model = parseModelAnswer(generation.content)
       }
-      if (await isCancelled(runId)) return finalizeCancelled(runId, run.workspaceId)
+      if (await isCancelled(runId)) return cancelNow()
 
       // --- Checking ---
       const t2 = Date.now()
@@ -304,7 +482,93 @@ export async function executeRun(runId: string): Promise<void> {
       timings.checkingMs = Date.now() - t2
     }
 
-    if (await isCancelled(runId)) return finalizeCancelled(runId, run.workspaceId)
+    if (await isCancelled(runId)) return cancelNow()
+
+    // --- Advisory claim-support assessment (R3, optional) ---
+    let claimRun: Awaited<ReturnType<typeof assessClaims>>['run'] | null = null
+    const claimAssessments = new Map<number, ClaimAssessment>()
+    if (
+      !earlyOutcome &&
+      claims.length > 0 &&
+      jevConfigState.config.claimCheckMode !== 'off'
+    ) {
+      const granted = runBudget.reserve(2000)
+      if (granted > 0) {
+        const assessed = await assessClaims({
+          runId,
+          workspaceId: run.workspaceId,
+          claims: claims.map((c) => ({
+            ordinal: c.ordinal,
+            text: c.text,
+            evidenceIds: c.evidenceIds,
+          })),
+          evidence: evidence.map((e) => ({ evidenceId: e.evidenceId, quote: e.quote })),
+          signal: stageAbort.signal,
+          deadlineMs: granted,
+        })
+        claimRun = assessed.run
+        assessed.assessments.forEach((v, k) => claimAssessments.set(k, v))
+        judgmentExtras.claimAssessment = {
+          status: assessed.run.status,
+          reason: assessed.run.reason,
+          requestedModel: assessed.run.requestedModel,
+          returnedModel: assessed.run.returnedModel,
+          rubricVersion: assessed.run.rubricVersion,
+          assessedCount: assessed.run.assessedCount,
+          notEvaluatedCount: assessed.run.notEvaluatedCount,
+          timingsMs: assessed.run.timingsMs,
+          usage: assessed.run.usage,
+          // Advisory relations as diagnostics — no source text.
+          assessments: [...assessed.assessments.entries()].map(([ordinal, a]) => ({
+            ordinal,
+            semanticStatus: a.semanticStatus,
+            relation: a.relation,
+            decisionStatus: a.decisionStatus,
+            confidence: a.confidence,
+          })),
+        }
+        if (assessed.run.usage.status === 'known') {
+          judgmentUsageRows.push({
+            model: assessed.run.returnedModel ?? assessed.run.requestedModel,
+            inputTokens: assessed.run.usage.inputTokens,
+            outputTokens: assessed.run.usage.outputTokens,
+          })
+        }
+        if (await isCancelled(runId)) return cancelNow()
+      }
+    }
+    // Final diagnostics merge (routing + rerank + claim assessment).
+    await db
+      .update(schema.runs)
+      .set({ details: { ...(retrieval?.details ?? {}), ...judgmentExtras } })
+      .where(eq(schema.runs.id, runId))
+
+    // Revalidate evidence against the CURRENT active builds and
+    // lifecycle before publication (spec §11.3, RANK-16). Sources can
+    // be deleted or replaced while generation was running.
+    const revalidated = await revalidateEvidence(run.workspaceId, evidence)
+    if (revalidated.removedChunkIds.length > 0) {
+      if (scope.type === 'selected_documents') {
+        await failSourceChanged(runId, run.workspaceId)
+        return
+      }
+      resultWarnings.push('A source changed during this answer; affected evidence was removed.')
+      const staleIds = new Set(revalidated.removedChunkIds)
+      evidence = evidence.filter((e) => !staleIds.has(e.chunkId))
+      const liveEvidenceIds = new Set(evidence.map((e) => e.evidenceId))
+      claims = claims
+        .map((c) => ({
+          ...c,
+          evidenceIds: c.evidenceIds.filter((id) => liveEvidenceIds.has(id)),
+        }))
+        .filter((c) => c.evidenceIds.length > 0)
+      if (outcome === 'answered' && claims.length === 0) {
+        outcome = 'insufficient_evidence'
+        limitations = [
+          'A source changed during this answer; the remaining documents do not answer it.',
+        ]
+      }
+    }
 
     // --- Final publication: one transaction (spec §14.4) ---
     const result: FinalResultOut = {
@@ -315,13 +579,33 @@ export async function executeRun(runId: string): Promise<void> {
       assistantMessageId: null,
       status: 'completed',
       outcome,
-      claims: claims.map((claim, i) => ({
-        ordinal: i + 1,
-        text: claim.text,
-        evidenceIds: claim.evidenceIds,
-        checkStatus: 'supported',
-        checkNote: 'Claim cites supplied evidence; handles validated deterministically.',
-      })),
+      claims: claims.map((claim) => {
+        const assessment =
+          jevConfigState.config.claimCheckMode === 'on'
+            ? claimAssessments.get(claim.ordinal)
+            : undefined
+        const assessed = assessment?.semanticStatus === 'assessed'
+        return {
+          ordinal: claim.ordinal,
+          text: claim.text,
+          evidenceIds: claim.evidenceIds,
+          checkStatus: 'supported',
+          checkNote: assessed
+            ? `Citation checked. Advisory model assessment: ${assessment!.relation} (confidence ${(assessment!.confidence ?? 0).toFixed(2)}) — not a truth guarantee.`
+            : 'Citation checked against supplied evidence; semantic support not evaluated.',
+          ...(assessed && assessment
+            ? {
+                assessment: {
+                  relation: assessment.relation,
+                  decisionStatus: assessment.decisionStatus,
+                  confidence: assessment.confidence,
+                  model: assessment.model,
+                  rubricVersion: assessment.rubricVersion,
+                },
+              }
+            : {}),
+        }
+      }),
       limitations,
       conflicts: [],
       evidence,
@@ -330,7 +614,7 @@ export async function executeRun(runId: string): Promise<void> {
         corpusGeneration: null,
         capturedAt: run.createdAt.toISOString(),
         scope,
-        documents: retrieval.details.candidates
+        documents: (retrieval?.details.candidates ?? [])
           .filter((c) => c.selected)
           .map((c) => ({
             id: c.documentId,
@@ -346,7 +630,7 @@ export async function executeRun(runId: string): Promise<void> {
             : `${process.env.EMBEDDING_MODEL ?? 'Xenova/bge-small-en-v1.5'} (local ONNX)`,
         generatorModel,
         reranker: null,
-        retrieval: retrieval.details.candidates.some((c) => c.denseRank != null)
+        retrieval: (retrieval?.details.candidates ?? []).some((c) => c.denseRank != null)
           ? 'dense+lexical-rrf'
           : 'lexical-rrf (degraded: dense unavailable)',
         mode: 'strict',
@@ -356,8 +640,13 @@ export async function executeRun(runId: string): Promise<void> {
         claimsChecked: claims.length,
         supported: claims.length,
         failed: 0,
+        method: 'citation_handle_membership',
+        semanticAssessed: [...claimAssessments.values()].filter(
+          (a) => a.semanticStatus === 'assessed'
+        ).length,
       },
       usage: { ...usage, status: usageStatus },
+      judgmentUsage: judgment?.usage ?? null,
       timings: { ...timings, totalMs: Date.now() - startedAtMs },
     }
 
@@ -389,7 +678,10 @@ export async function executeRun(runId: string): Promise<void> {
       result.userMessageId = userMessage?.id ?? null
       result.assistantMessageId = assistant?.id ?? null
 
-      await tx
+      // Fencing: only the worker holding a 'running' run may publish.
+      // A cancellation committed first wins (APP-05); a stale worker
+      // must not overwrite newer or terminal state (APP-04).
+      const fenced = await tx
         .update(schema.runs)
         .set({
           status: 'completed',
@@ -397,7 +689,11 @@ export async function executeRun(runId: string): Promise<void> {
           result,
           completedAt: new Date(),
         })
-        .where(eq(schema.runs.id, runId))
+        .where(and(eq(schema.runs.id, runId), eq(schema.runs.status, 'running')))
+        .returning({ id: schema.runs.id })
+      if (fenced.length === 0) {
+        throw new Error('stale_worker')
+      }
       await tx.insert(schema.runEvents).values([
         {
           runId,
@@ -423,6 +719,10 @@ export async function executeRun(runId: string): Promise<void> {
         .where(and(eq(schema.jobs.kind, 'answer'), eq(schema.jobs.refId, runId)))
     })
   } catch (err) {
+    if (err instanceof Error && err.message === 'stale_worker') {
+      console.warn(`[answers] run ${runId}: finalization lost the lease; stale publication skipped`)
+      return
+    }
     const message = err instanceof Error ? err.message : 'The run failed.'
     console.error(`[answers] run ${runId} failed:`, message)
     await db
@@ -453,7 +753,7 @@ function extractiveAnswer(
   evidence: EvidenceOut[]
 ): {
   outcome: 'answered' | 'insufficient_evidence'
-  claims: { text: string; evidenceIds: string[] }[]
+  claims: { ordinal: number; text: string; evidenceIds: string[] }[]
   limitations: string[]
 } {
   const terms = question
@@ -481,7 +781,11 @@ function extractiveAnswer(
       limitations: ['Insufficient evidence in the selected documents to answer this question.'],
     }
   }
-  return { outcome: 'answered', claims, limitations: [] }
+  return {
+    outcome: 'answered',
+    claims: claims.map((c, i) => ({ ...c, ordinal: i + 1 })),
+    limitations: [],
+  }
 }
 
 const STOPWORDS = new Set([
@@ -494,11 +798,65 @@ const STOPWORDS = new Set([
 ])
 
 async function finalizeCancelled(runId: string, workspaceId: string) {
-  await db
+  const fenced = await db
     .update(schema.runs)
     .set({ status: 'cancelled', completedAt: new Date() })
-    .where(eq(schema.runs.id, runId))
+    .where(
+      and(
+        eq(schema.runs.id, runId),
+        sql`${schema.runs.status} in ('queued','running','cancelling')`
+      )
+    )
+    .returning({ id: schema.runs.id })
+  if (fenced.length === 0) return
   await appendRunEvent(runId, workspaceId, 'run.cancelled')
+}
+
+/** Typed operational failure when strict selected scope can no longer
+ *  be fulfilled because a source changed mid-run (spec §11.3). */
+async function failSourceChanged(runId: string, workspaceId: string) {
+  const fenced = await db
+    .update(schema.runs)
+    .set({
+      status: 'failed',
+      errorCode: 'SOURCE_CHANGED',
+      errorMessage: 'A selected source changed during this answer. Start a new run with an updated scope.',
+      errorRetryable: false,
+      completedAt: new Date(),
+    })
+    .where(and(eq(schema.runs.id, runId), sql`${schema.runs.status} in ('running','cancelling')`))
+    .returning({ id: schema.runs.id })
+  if (fenced.length === 0) return
+  await appendRunEvent(runId, workspaceId, 'run.failed', {
+    code: 'SOURCE_CHANGED',
+    message: 'A selected source changed during this answer.',
+    retryable: false,
+  })
+}
+
+/** Recheck that evidence chunks still belong to their documents'
+ *  current active build and version, and that documents are active. */
+async function revalidateEvidence(
+  workspaceId: string,
+  evidence: EvidenceOut[]
+): Promise<{ removedChunkIds: string[] }> {
+  if (evidence.length === 0) return { removedChunkIds: [] }
+  const ids = evidence.map((e) => e.chunkId)
+  const rows = await db
+    .select({ id: schema.chunks.id })
+    .from(schema.chunks)
+    .innerJoin(schema.documents, eq(schema.documents.id, schema.chunks.documentId))
+    .where(
+      and(
+        eq(schema.chunks.workspaceId, workspaceId),
+        eq(schema.documents.lifecycle, 'active'),
+        eq(schema.documents.activeBuildId, schema.chunks.buildId),
+        eq(schema.documents.activeVersionId, schema.chunks.versionId),
+        sql`${schema.chunks.id} = any(${uuidArrayLiteral(ids)}::uuid[])`
+      )
+    )
+  const valid = new Set(rows.map((r) => r.id))
+  return { removedChunkIds: ids.filter((id) => !valid.has(id)) }
 }
 
 export async function recentRuns(workspaceId: string, limit: number) {
