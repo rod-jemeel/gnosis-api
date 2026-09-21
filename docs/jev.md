@@ -23,6 +23,9 @@ support (INV-11).
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `JEV_MODE` | `off` | `off` / `shadow` / `on` for reranking only |
+| `JEV_ROUTING_MODE` | `off` | R2 request routing; independent of JEV_MODE |
+| `JEV_CLAIM_CHECK_MODE` | `off` | R3 advisory claim-support assessment; independent of JEV_MODE |
+| `JEV_MAX_RUN_HTTP_MS` | 2000 | Aggregate Jev HTTP budget per run (routing 500ms, rerank 1500ms, claim 1000ms ceilings, bounded by remainder) |
 | `JEV_KILL_SWITCH` | `false` | Stops **all** Jev traffic, overriding every mode |
 | `TYPESAFE_API_KEY` | unset | Server-side secret; presence alone enables nothing |
 | `TYPESAFE_MODEL` | `jev-latest` | Dev alias; production requires a pinned, verified model |

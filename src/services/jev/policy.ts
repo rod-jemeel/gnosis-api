@@ -15,6 +15,9 @@ export type JevMode = 'off' | 'shadow' | 'on'
 
 export interface JevConfig {
   mode: JevMode
+  routingMode: JevMode
+  claimCheckMode: JevMode
+  maxRunHttpMs: number
   killSwitch: boolean
   apiKey: string | null
   model: string
@@ -53,6 +56,16 @@ export function parseJevConfig(env: NodeJS.ProcessEnv): JevConfigState {
           issues.push('invalid_mode')
           return 'off' as JevMode
         })()
+
+  const stageMode = (name: string): JevMode => {
+    const raw = (env[name] ?? 'off').trim().toLowerCase()
+    if (raw === 'shadow' || raw === 'on') return raw as JevMode
+    if (raw !== 'off') issues.push(`invalid_${name.toLowerCase()}`)
+    return 'off'
+  }
+  // CFG-05: stage flags are independent; JEV_MODE governs reranking only.
+  const routingMode = stageMode('JEV_ROUTING_MODE')
+  const claimCheckMode = stageMode('JEV_CLAIM_CHECK_MODE')
 
   const killSwitchRaw = booleanEnv.safeParse(env.JEV_KILL_SWITCH ?? 'false')
   if (!killSwitchRaw.success) issues.push('invalid_kill_switch')
@@ -99,6 +112,10 @@ export function parseJevConfig(env: NodeJS.ProcessEnv): JevConfigState {
   const maxResponseBytes = numeric('JEV_MAX_RESPONSE_BYTES', 1024, null, 65536)
   const maxInflightPerWorkspace = numeric('JEV_MAX_INFLIGHT_PER_WORKSPACE', 1, null, 2)
   const maxInflightPerCredential = numeric('JEV_MAX_INFLIGHT_PER_CREDENTIAL', 1, null, 4)
+  // Section 10.3: aggregate Jev HTTP budget across stages; per-stage
+  // ceilings (500 routing / 1500 rerank / 1000 claim) are bounded by
+  // the remainder of this budget.
+  const maxRunHttpMs = numeric('JEV_MAX_RUN_HTTP_MS', 500, 10000, 2000)
 
   const rateRaw = env.JEV_SHADOW_SAMPLE_RATE === undefined ? 1 : Number(env.JEV_SHADOW_SAMPLE_RATE)
   let shadowSampleRate = 1
@@ -114,6 +131,9 @@ export function parseJevConfig(env: NodeJS.ProcessEnv): JevConfigState {
     issues,
     config: {
       mode,
+      routingMode,
+      claimCheckMode,
+      maxRunHttpMs,
       killSwitch,
       apiKey,
       model,
@@ -128,6 +148,25 @@ export function parseJevConfig(env: NodeJS.ProcessEnv): JevConfigState {
       shadowSampleRate,
     },
   }
+}
+
+/**
+ * Stage-aware processing decision: identical checks, but the enabled
+ * gate and sampling key off the calling stage's own mode. JEV_MODE
+ * never acts as a master switch for other stages (CFG-05).
+ */
+export function resolveStageDecision(
+  configState: JevConfigState,
+  stage: 'rerank' | 'route' | 'claim_support',
+  input: ProcessingDecisionInput
+): ProcessingDecision {
+  const mode =
+    stage === 'rerank'
+      ? configState.config.mode
+      : stage === 'route'
+        ? configState.config.routingMode
+        : configState.config.claimCheckMode
+  return resolveProcessingDecision(configState, input, mode)
 }
 
 /** Process-wide, validated once (spec §8.2: one validated object). */
@@ -158,10 +197,11 @@ export interface ProcessingDecision {
  */
 export function resolveProcessingDecision(
   configState: JevConfigState,
-  input: ProcessingDecisionInput
+  input: ProcessingDecisionInput,
+  mode: JevMode = configState.config.mode
 ): ProcessingDecision {
   const config = configState.config
-  if (config.mode === 'off') return { allowed: false, reason: 'off' }
+  if (mode === 'off') return { allowed: false, reason: 'off' }
   if (config.killSwitch) return { allowed: false, reason: 'kill_switch' }
   if (!configState.valid) return { allowed: false, reason: 'invalid_configuration' }
   if (!config.apiKey) return { allowed: false, reason: 'missing_key' }
@@ -171,10 +211,7 @@ export function resolveProcessingDecision(
   if (input.candidateCount < 2) {
     return { allowed: false, reason: 'too_few_candidates' }
   }
-  if (
-    config.mode === 'shadow' &&
-    !deterministicSample(input.invocationId, config.shadowSampleRate)
-  ) {
+  if (mode === 'shadow' && !deterministicSample(input.invocationId, config.shadowSampleRate)) {
     return { allowed: false, reason: 'off' }
   }
   return { allowed: true, reason: null }

@@ -8,6 +8,8 @@
  *   TYPESAFE_LIVE_SMOKE=1 TYPESAFE_API_KEY=... pnpm test:jev:live
  */
 
+import '../../src/env.js'
+
 const apiKey = process.env.TYPESAFE_API_KEY
 const optedIn = process.env.TYPESAFE_LIVE_SMOKE === '1'
 
@@ -20,8 +22,8 @@ if (!optedIn || !apiKey) {
   process.exit(1)
 }
 
-const { callTypesafe } = await import('../src/providers/typesafe/client.ts')
-const { validateScoreBatch } = await import('../src/providers/typesafe/schemas.ts')
+const { callTypesafe } = await import('../../src/providers/typesafe/client.ts')
+const { validateScoreBatch } = await import('../../src/providers/typesafe/schemas.ts')
 
 const request = {
   model: process.env.TYPESAFE_MODEL ?? 'jev-latest',

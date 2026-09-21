@@ -38,10 +38,19 @@ export interface ScoreQuestion {
   criteria: [string, string, string, string]
 }
 
+export interface ChoiceQuestion {
+  type: 'choice'
+  instructions: string
+  /** Registered labels mapped to descriptions — state cannot add choices. */
+  criteria: Record<string, string>
+}
+
+export type TypesafeQuestion = ScoreQuestion | ChoiceQuestion
+
 export interface TypesafeRequest {
   model: string
   state: Record<string, unknown>
-  questions: Record<string, ScoreQuestion>
+  questions: Record<string, TypesafeQuestion>
 }
 
 export interface TypesafeUsage {

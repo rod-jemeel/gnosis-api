@@ -129,3 +129,96 @@ export function validateScoreBatch(
 export function describeScoreQuestion(question: ScoreQuestion): string {
   return `${question.type}: ${question.instructions} [${question.criteria.join(' | ')}]`
 }
+
+export interface ValidatedChoiceAnswer {
+  label: string
+  confidence: number
+  probabilities: Record<string, number>
+}
+
+export interface ChoiceBatchValidation {
+  ok: boolean
+  reason: 'invalid_response' | 'model_mismatch' | null
+  answers: Map<string, ValidatedChoiceAnswer>
+  returnedModel: string | null
+  usage: TypesafeUsage
+}
+
+/**
+ * Validate a Choice batch: labels must be members of the allowed set,
+ * probability keys must be exactly the allowed labels, each in [0,1],
+ * summing to 1 within tolerance. Unknown labels reject the batch.
+ */
+export function validateChoiceBatch(
+  request: TypesafeRequest,
+  expectedKeys: string[],
+  allowedLabels: readonly string[],
+  responseBody: unknown,
+  opts: { requestedModel: string; modelAliasAllowed: boolean }
+): ChoiceBatchValidation {
+  const usageUnknown: TypesafeUsage = { inputTokens: null, outputTokens: null, status: 'unavailable' }
+  const invalid = (): ChoiceBatchValidation => ({
+    ok: false, reason: 'invalid_response', answers: new Map(), returnedModel: null, usage: usageUnknown,
+  })
+
+  if (typeof responseBody !== 'object' || responseBody === null) return invalid()
+  const body = responseBody as Record<string, unknown>
+
+  const returnedModel =
+    typeof body.model === 'string' && body.model.trim().length > 0 ? body.model.trim() : null
+  if (!returnedModel) return invalid()
+  if (!opts.modelAliasAllowed && returnedModel !== opts.requestedModel) {
+    return { ok: false, reason: 'model_mismatch', answers: new Map(), returnedModel, usage: usageUnknown }
+  }
+
+  const rawUsage = body.usage as Record<string, unknown> | undefined
+  const inputTokens = rawUsage ? safeNonNegativeInt(rawUsage.inputTokens ?? rawUsage.input_tokens) : null
+  const outputTokens = rawUsage ? safeNonNegativeInt(rawUsage.outputTokens ?? rawUsage.output_tokens) : null
+  const usage: TypesafeUsage =
+    inputTokens === null && outputTokens === null
+      ? usageUnknown
+      : { inputTokens, outputTokens, status: 'known' }
+
+  const answersRaw = body.answers
+  if (typeof answersRaw !== 'object' || answersRaw === null) return invalid()
+  const answers = answersRaw as Record<string, unknown>
+
+  const expected = new Set(expectedKeys)
+  const actual = new Set(Object.keys(answers))
+  if (actual.size !== expected.size || expectedKeys.some((k) => !actual.has(k))) {
+    return invalid()
+  }
+
+  const allowed = new Set(allowedLabels)
+  const validated = new Map<string, ValidatedChoiceAnswer>()
+  for (const key of expectedKeys) {
+    const answer = answers[key]
+    if (typeof answer !== 'object' || answer === null) return invalid()
+    const a = answer as Record<string, unknown>
+    const label = a.choice ?? a.label
+    if (typeof label !== 'string' || !allowed.has(label)) return invalid()
+    const confidence = a.confidence
+    if (typeof confidence !== 'number' || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+      return invalid()
+    }
+    const probabilities = a.probabilities
+    if (typeof probabilities !== 'object' || probabilities === null) return invalid()
+    const p = probabilities as Record<string, unknown>
+    // The provider omits zero-mass labels: keys must be a subset of the
+    // allowed labels; unknown labels reject.
+    const pKeys = Object.keys(p)
+    if (pKeys.length > allowed.size || !pKeys.every((k) => allowed.has(k))) return invalid()
+    let sum = 0
+    const cleaned: Record<string, number> = {}
+    for (const k of pKeys) {
+      const v = p[k]
+      if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1) return invalid()
+      sum += v
+      cleaned[k] = v
+    }
+    if (Math.abs(sum - 1) > SUM_TOLERANCE) return invalid()
+    validated.set(key, { label, confidence, probabilities: cleaned })
+  }
+
+  return { ok: true, reason: null, answers: validated, returnedModel, usage }
+}

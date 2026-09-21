@@ -1,6 +1,6 @@
 /**
- * Shared capacity admission and credential circuit breaker (spec §10.5,
- * §10.6).
+ * Shared capacity admission, credential circuit breaker, and the
+ * aggregate per-run Jev HTTP budget (spec §10.3, §10.5, §10.6).
  *
  * This deployment runs API + workers in one process, so process-local
  * counters satisfy the shared-capacity requirement; a replicated
@@ -10,6 +10,7 @@
  */
 
 import type { SafeReason } from '../../providers/typesafe/types.js'
+import { jevConfigState } from './policy.js'
 
 export interface CapacityLease {
   key: string
@@ -116,5 +117,42 @@ export class JudgmentCircuitBreaker {
       this.openedAt = now
       this.consecutiveRetryable = 0
     }
+  }
+}
+
+/**
+ * Aggregate Jev HTTP budget for one run (§10.3): stages reserve from
+ * one remainder — routing 500ms, reranking 1500ms, claim assessment
+ * 1000ms, each bounded by what remains. An optional stage with a
+ * nonpositive grant reports budget_exhausted instead of running.
+ */
+/**
+ * Shared across ALL Jev stages (rerank, route, claim): capacity is a
+ * property of the credential/workspace pair, not of the stage.
+ */
+export const limiter = new CapacityLimiter(
+  jevConfigState.config.maxInflightPerWorkspace,
+  jevConfigState.config.maxInflightPerCredential
+)
+export const breaker = new JudgmentCircuitBreaker()
+
+export class JevRunBudget {
+  private consumedMs = 0
+
+  constructor(private readonly totalMs: number) {}
+
+  reserve(ceilingMs: number): number {
+    const remaining = this.totalMs - this.consumedMs
+    const granted = Math.min(ceilingMs, Math.max(0, remaining))
+    this.consumedMs += granted
+    return granted
+  }
+
+  recordActual(ms: number): void {
+    this.consumedMs = Math.min(this.totalMs, this.consumedMs + Math.max(0, ms))
+  }
+
+  remaining(): number {
+    return Math.max(0, this.totalMs - this.consumedMs)
   }
 }

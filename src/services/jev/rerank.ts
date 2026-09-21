@@ -14,7 +14,7 @@ import { callTypesafe } from '../../providers/typesafe/client.js'
 import { validateScoreBatch } from '../../providers/typesafe/schemas.js'
 import type { SafeReason, TypesafeRequest } from '../../providers/typesafe/types.js'
 import { jevConfigState, modelAliasAllowed, resolveProcessingDecision } from './policy.js'
-import { CapacityLimiter, JudgmentCircuitBreaker } from './budget.js'
+import { breaker, limiter } from './budget.js'
 
 export const RUBRIC_VERSION = 'relevance-v1'
 /** relevance-v1 rubric, frozen (spec §9.3). */
@@ -59,13 +59,6 @@ export interface RerankDecision {
   timingsMs: number
   usage: { inputTokens: number | null; outputTokens: number | null; status: 'known' | 'unavailable' }
 }
-
-/** Process-wide capacity and breaker; single-process deployment. */
-const limiter = new CapacityLimiter(
-  jevConfigState.config.maxInflightPerWorkspace,
-  jevConfigState.config.maxInflightPerCredential
-)
-const breaker = new JudgmentCircuitBreaker()
 
 /**
  * UTF-8-safe excerpt: at most maxBytes of the first bytes of the text,

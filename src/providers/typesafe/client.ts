@@ -17,6 +17,8 @@ import type {
 import { TYPESAFE_ENDPOINT } from './types.js'
 
 function mapStatusToReason(status: number): TransportResult & { ok: false } {
+  // Internal-only sanitized status; no body content is logged (NET-12).
+  console.warn('[typesafe] transport non-ok status:', status)
   if (status === 401 || status === 403) {
     return { ok: false, reason: 'authentication_failed', httpStatus: status }
   }
